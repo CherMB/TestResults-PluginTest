@@ -1,69 +1,224 @@
 pipeline {
-    agent any
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    jenkins: agent
+    app: pyexample2-ci
+spec:
+  containers:
+  - name: python
+    image: python:3.13
+    command:
+    - cat
+    tty: true
+    resources:
+      requests:
+        memory: "768Mi"
+        cpu: "500m"
+      limits:
+        memory: "1.5Gi"
+        cpu: "1000m"
+'''
+            defaultContainer 'python'
+        }
+    }
 
     environment {
-        // You can set environment variables here
-        MAVEN_OPTS = "-Dmaven.test.failure.ignore=true"
+        POETRY_VERSION = '1.7.1'
+        POETRY_HOME = '/opt/poetry'
+        POETRY_VIRTUALENVS_IN_PROJECT = 'true'
+        POETRY_NO_INTERACTION = '1'
+        PYTHONUNBUFFERED = '1'
+        SNYK_INTEGRATION_NAME = 'JENKINS'
     }
 
-      tools {
-        maven 'Maven 3'  // Define your Maven installation name from Jenkins Global Tool Configuration
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '10'))
+        timeout(time: 30, unit: 'MINUTES')
     }
 
-   
-    stages {    
-       stage('Registering build artifact') {
+    stages {
+        stage('Checkout') {
             steps {
-                echo 'Registering the metadata'
-                echo 'Another echo to make the pipeline a bit more complex'
-                registerBuildArtifactMetadata(
-                    name: "test-artifact-cherryl",
-                    version: "1.0.0",
-                    type: "docker",
-                    url: "http://non:1111",
-                    digest: "6f637064707039346163663237383938",
-                    label: "prod"
-                )
-            }
-        }
-        
-        stage('Build & Test') {
-            steps {
-                sh 'mvn clean test'
+                checkout scm
+                script {
+                    // Fix git safe directory issue in containers
+                    sh 'git config --global --add safe.directory "*"'
+
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: "git rev-parse --short HEAD",
+                        returnStdout: true
+                    ).trim()
+                    env.GIT_BRANCH_NAME = sh(
+                        script: "git rev-parse --abbrev-ref HEAD",
+                        returnStdout: true
+                    ).trim()
+                    echo "Building commit ${env.GIT_COMMIT_SHORT} on branch ${env.GIT_BRANCH_NAME}"
+                }
             }
         }
 
-        stage('Publish Test Results') {
+        stage('Test') {
+            options {
+                timeout(time: 10, unit: 'MINUTES')
+            }
             steps {
-                junit 'target/surefire-reports/*.xml'
+                container('python') {
+                    sh '''
+                        echo "=== Installing Poetry ==="
+                        pip install --no-cache-dir poetry==${POETRY_VERSION}
+
+                        echo "=== Poetry version ==="
+                        poetry --version
+
+                        echo "=== Installing dependencies ==="
+                        poetry install --with dev --no-root
+
+                        echo "=== Running tests with coverage ==="
+                        poetry run pytest \
+                            --junitxml=test-results.xml \
+                            --cov=app \
+                            --cov-report=markdown:coverage.md \
+                            --cov-report=term \
+                            --cov-report=html:coverage-html \
+                            -v
+
+                        echo "=== Coverage Summary ==="
+                        cat coverage.md
+                    '''
+                    junit 'test-results.xml'
+                }
             }
         }
-        // stage('Check Test Report Files') {
-        //     steps {
-        //         sh '''
-        //         echo "📂 Listing test report files..."
-        //         ls -l target/surefire-reports/*.xml || echo "❌ No XML files found"
-        //         '''
-        //     }
-        // }
-        // stage('Publish Test Results') {
-        //     steps {
-        //         junit testResults: 'target/surefire-reports/*.xml', allowEmptyResults: true, skipMarkingBuildUnstable: false
-        //     }
-        // }
-        
-      
+
+        stage('Snyk SAST') {
+            options {
+                timeout(time: 10, unit: 'MINUTES')
+            }
+            steps {
+                container('python') {
+                    catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                        withCredentials([
+                            string(credentialsId: 'snyk-token', variable: 'SNYK_TOKEN'),
+                            string(credentialsId: 'snyk-org', variable: 'SNYK_ORG')
+                        ]) {
+                            sh '''
+                                echo "=== Installing Snyk CLI ==="
+                                curl -Lo /usr/local/bin/snyk https://downloads.snyk.io/cli/stable/snyk-linux
+                                chmod +x /usr/local/bin/snyk
+
+                                echo "=== Authenticating with Snyk ==="
+                                snyk auth ${SNYK_TOKEN}
+
+                                echo "=== Running Snyk Code (SAST) scan ==="
+                                snyk code test \
+                                    --org=${SNYK_ORG} \
+                                    --project-name=TEST_CX_NAME_pyexample2 \
+                                    --severity-threshold=medium \
+                                    --remote-repo-url=https://github.com/ldorg/pyexample2 \
+                                    --json-file-output=snyk-sast-results.json \
+                                    --sarif-file-output=snyk-sast-results.sarif \
+                                    || echo "Snyk SAST found issues (exit code: $?)"
+
+                                echo "=== SAST Scan Summary ==="
+                                if [ -f snyk-sast-results.json ]; then
+                                    python -c "import json; data=json.load(open('snyk-sast-results.json')); print('SAST scan completed')" || true
+                                fi
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Snyk SCA') {
+            options {
+                timeout(time: 10, unit: 'MINUTES')
+            }
+            steps {
+                container('python') {
+                    catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                        withCredentials([
+                            string(credentialsId: 'snyk-token', variable: 'SNYK_TOKEN'),
+                            string(credentialsId: 'snyk-org', variable: 'SNYK_ORG')
+                        ]) {
+                            sh '''
+                                echo "=== Re-authenticating with Snyk ==="
+                                snyk auth ${SNYK_TOKEN}
+
+                                echo "=== Installing project dependencies for SCA scan ==="
+                                # Dependencies should already be installed from test stage
+                                poetry install --no-dev || poetry install --without dev
+
+                                echo "=== Running Snyk Open Source (SCA) scan ==="
+                                snyk test \
+                                    --org=${SNYK_ORG} \
+                                    --project-name=TEST_CX_NAME_pyexample2 \
+                                    --severity-threshold=medium \
+                                    --remote-repo-url=https://github.com/ldorg/pyexample2 \
+                                    --json-file-output=snyk-sca-results.json \
+                                    --sarif-file-output=snyk-sca-results.sarif \
+                                    || echo "Snyk SCA found vulnerabilities (exit code: $?)"
+
+                                echo "=== SCA Scan Summary ==="
+                                if [ -f snyk-sca-results.json ]; then
+                                    python -c "import json; data=json.load(open('snyk-sca-results.json')); print('SCA scan completed')" || true
+                                fi
+                            '''
+                        }
+                    }
+                }
+            }
+        }
     }
-    
-
 
     post {
         always {
-            echo 'Pipeline completed.'
+            // Publish JUnit test results
+
+            // Archive coverage reports
+            archiveArtifacts artifacts: 'coverage.md,coverage-html/**', allowEmptyArchive: false, fingerprint: true
+
+            // Archive Snyk security scan results
+            archiveArtifacts artifacts: 'snyk-*.json,snyk-*.sarif', allowEmptyArchive: true, fingerprint: true
+
+            // Register security scans with CloudBees Unify
+            script {
+                if (fileExists('snyk-sast-results.sarif')) {
+                    registerSecurityScan(
+                        artifacts: 'snyk-sast-results.sarif',
+                        format: 'sarif',
+                        archive: true
+                    )
+                }
+                if (fileExists('snyk-sca-results.sarif')) {
+                    registerSecurityScan(
+                        artifacts: 'snyk-sca-results.sarif',
+                        format: 'sarif',
+                        archive: true
+                    )
+                }
+            }
         }
+
+        success {
+            echo "✓ Pipeline completed successfully!"
+            echo "  Commit: ${env.GIT_COMMIT_SHORT}"
+            echo "  Branch: ${env.GIT_BRANCH_NAME}"
+        }
+
+        unstable {
+            echo "⚠ Pipeline completed with warnings"
+            echo "  This may indicate security findings or test failures that didn't fail the build"
+        }
+
         failure {
-            echo 'Build or tests failed!'
+            echo "✗ Pipeline failed!"
+            echo "  Check the logs above for error details"
         }
     }
 }
-  
